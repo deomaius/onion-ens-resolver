@@ -4,6 +4,7 @@ declare module "web3"
 declare module "dotenv"
 declare module "cids"
 declare module "multiformats/cid"
-
+declare module "file-type"
 declare module "@ensdomains/content-hash"
 declare module "ipfs-http-client"
+declare module "tar-fs"
