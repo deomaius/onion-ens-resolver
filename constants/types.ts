@@ -6,3 +6,7 @@ import { CID } from 'multiformats/cid'
 export type CIDContentHash = typeof CID
 export type Response = client.Response
 export type Request = client.Request
+export type ContentHash = { 
+	type: string, 
+	payload: CIDContentHash | string 
+}
