@@ -28,14 +28,14 @@ const NA_IPFS_CONTENT = new Buffer([])
 const NODE_ENDPOINT = new URL('http://127.0.0.1:5001')
 
 const IPFS_NODE = ipfs.create({ url: NODE_ENDPOINT })
-const TOR_NODE = new ths()
+const TOR_NODE = new ths(path.join(path.resolve(), 'cache'))
 const SERVER = express()
-const PORT = 1337
+const PORT = 1338
 
-function startResolver() {
-  if (!fs.existsSync('./cache')){
-    fs.mkdirSync('./cache')
-  } 
+async function startResolver() {
+  await TOR_NODE.setTorCommand('/usr/bin/tor-browser')
+  await TOR_NODE.start(true)
+  await TOR_NODE.loadConfig()
 }
 
 async function getContentHash(label: string): Promise<ContentHash> { 
@@ -108,23 +108,39 @@ async function pinIPFSContent(contentHash: CIDContentHash | string): Promise<boo
 async function isPinnedContent(contentHash: CIDContentHash | string): Promise<boolean> {  
   const clientRequest = await IPFS_NODE.pin.ls() 
 
-  let pinnedContent: Array<{ cid: CIDContentHash | string, type: string }> = []
+  let pinnedContent: Array<{ cid: CIDContentHash, type: string }> = []
 
-  for await(const e of clientRequest) {
-    pinnedContent = pinnedContent.concat(e)
-  }
+  for await(const e of clientRequest) { pinnedContent = pinnedContent.concat(e) }
 
-  const filter = pinnedContent.filter(e => e.cid === contentHash.cid)
+  const filter = pinnedContent.filter((e) => e.cid.toString() === contentHash.toString())
   const isPinned = filter.length !== 0
 
   return isPinned
 }
 
-function createHiddenService() {}
+async function createHiddenService(contentHash: CIDContentHash | string) {
+    await TOR_NODE.createHiddenService(
+      contentHash.toString(), 
+      [ 3000 ],
+      true
+    )
+}
 
 function loadHiddenService() {}
 
-function getHiddenService() {}
+async function getHiddenService(
+  contentHash: CIDContentHash | string,
+  isCached: boolean
+) {
+  try {
+    await createHiddenService(contentHash)
+  } catch (e) {}
+
+  const activeServices = await TOR_NODE.getServices()
+  const onionAddress = await TOR_NODE.getOnionAddress(contentHash)
+
+  return onionAddress
+}
 
 function parseENSDomain(hostname: string): string {
   let ensLabel = hostname.split('.3th.ws')[0]
@@ -143,7 +159,7 @@ async function handleWildcardPropogation(
   let hostName
   // local env, workaround for prototyping
   if (!req.hostname.includes('.3th.ws')) {
-    hostName = 'firn.3th.ws'
+    hostName = 'onion.tornadocashcommunity.3th.ws'
   } else {
     hostName = req.hostname
   }
@@ -158,11 +174,12 @@ async function handleWildcardPropogation(
 
     if (!(type === 'ipfs' || type === 'ipns')) {
       res.send("CONTENT NOT SUPPORTED") 
+      return
     }
 
     const isCached = await isPinnedContent(ipfsContentHash)
 
-    if(!isCached) {
+    if(isCached) {
       const ipfsContent = await getIPFSContent(ipfsContentHash)
 
       await cacheIPFSContent(ipfsContentHash, ipfsContent)
@@ -170,24 +187,31 @@ async function handleWildcardPropogation(
     }
 
     const contentPath = path.join(
-      path.resolve(), 'cache', ipfsContentHash.toString(), 
+      path.resolve(), 'cache', ipfsContentHash.toString(), 'index.html'
     ) 
 
-    // if (!fs.existsSync(contentPath + 'index.html')) {
-    //  res.send("NO STATIC CONTENT AVAILABLE")
-    // }
+    if (!fs.existsSync(contentPath)) {
+      res.send("NO STATIC CONTENT AVAILABLE")
+      return
+    }
 
     if (serveOnions) {
-      const hiddenService = getHiddenService()
+      const hiddenService = await getHiddenService(
+        ipfsContentHash, 
+        isCached
+      )
       
       res.send('NO ONIONS')
+      return
     } else { 
       SERVER.use(express.static(contentPath))  
       res.sendFile('index.html', { root: contentPath })
+      return
     }
   } catch (e) {
     console.log('ERROR', e)
     res.send('FAILED TO RESOLVE')
+    return
   }
 }
 
@@ -198,9 +222,9 @@ SERVER.use(cors())
 
 SERVER.get('/', handleWildcardPropogation)
  
-SERVER.listen(PORT, () => {
+SERVER.listen(PORT, async() => {
   try {
-    startResolver()
+    await startResolver()
     console.log('// Resolver ::: on //') 
   } catch (e) {
     console.log(`// Failed ::: ${e} //`)
