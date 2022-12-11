@@ -165,6 +165,26 @@ async function getContentHashFromOnionAddress(onionAddress: string): Promise<str
   return matchingServices[0]?.name
 }
 
+async function handleWildcardOnions(
+  req: Request,
+  res: Response
+) {
+  const ipfsHash = await getContentHashFromOnionAddress(req.hostname)
+  
+  if(ipfsHash) {
+    const dynamicOnionPath = path.join(
+      path.resolve(), 'cache', ipfsHash
+    )  
+
+    RSERVER.use(express.static(dynamicOnionPath))
+    res.sendFile('index.html', { root: dynamicOnionPath })
+  
+    return
+  } else {
+    res.send('NO IPFS STORE')
+  }
+}
+
 async function handleWildcardPropogation(
   req: Request,
   res: Response
@@ -215,25 +235,9 @@ async function handleWildcardPropogation(
       )
 
       if(hiddenService) { 
-        RSERVER.use(express.static(contentPath))
-	RSERVER.get('/', async(req: Request, res: Response) => {
-          if(req.hostname === hiddenService) {
-            const ipfsHash = await getContentHashFromOnionAddress(req.hostname)
-    	    const dynamicOnionPath = path.join(
-     		 path.resolve(), 'cache', ipfsHash
-	    )
-
-	    RSERVER.use(express.static(dynamicOnionPath))
-            res.sendFile('index.html', { root: dynamicOnionPath })
-            return
-  	  } else {
-	    res.sendFile('CANNOT PEEL')
-	    return
-          }
-        })
-	res.send(hiddenService)
+	     res.send(hiddenService)
       } else {
-	res.send('NO ONIONS')
+	     res.send('NO ONIONS')
       }
       return
     } else { 
@@ -256,6 +260,7 @@ SERVER.use(express.raw())
 SERVER.use(cors())
 
 SERVER.get('/', handleWildcardPropogation)
+RSERVER.get('/', handleWildcardOnions)
  
 SERVER.listen(PORT, async() => {
   try {
