@@ -1,15 +1,13 @@
 import express from "express"
-import dotenv from "dotenv"
 import cors from "cors"
 import fs from "fs"
 import path from "path"
+
 import ths from "ths"
 import web3 from "web3"
 import enshash from "@ensdomains/content-hash"
-import * as tarfs from "tar-fs"
-
 import * as ipfs from "ipfs-http-client"
-import * as ft from 'file-type'
+import * as tarfs from "tar-fs"
 
 import { CID } from 'multiformats/cid'
 import { base64 } from 'multiformats/bases/base64'
@@ -17,32 +15,24 @@ import { Blob } from 'node:buffer'
 import { Readable } from 'node:stream'
 
 import config from './constants/config.js'
-import { 
-  CIDContentHash,
-  ContentHash, 
-  Response, 
-  Request 
-} from './constants/types.js'
+import message from './constants/msgs.js'
+import * as types from './constants/types.js'
 
-const NA_IPFS_CONTENT = new Buffer([])
-const NODE_ENDPOINT = new URL('http://127.0.0.1:5001')
-
+const NODE_ENDPOINT = new URL(config.IFPS_NODE_ENDPOINT)
 const IPFS_NODE = ipfs.create({ url: NODE_ENDPOINT })
-const TOR_NODE = new ths(path.join(path.resolve(), 'cache'))
+const TOR_NODE = new ths()
 const SERVER = express()
-const RSERVER = express()
-const PORT = 1337
-const RPORT = 3000
+const ONION_SERVER = express()
 
 async function startResolver() {
-  await TOR_NODE.setTorCommand('/usr/local/bin/tor')
+  await TOR_NODE.setTorCommand(config.TOR_PATH)
   await TOR_NODE.loadConfig()
   await TOR_NODE.start(true)
-  await RSERVER.listen(RPORT)
+  await ONION_SERVER.listen(config.ONION_PORT)
 }
 
-async function getContentHash(label: string): Promise<ContentHash> { 
-  const provider = new web3(config.rpcProvider)
+async function getContentHash(label: string): Promise<types.ContentHash> { 
+  const provider = new web3(config.RPC_PROVIDER)
   const ensContentHash = await provider.eth.ens.getContenthash(label)
   const { cidV0ToV1Base32} = enshash.helpers
 
@@ -72,13 +62,13 @@ async function getContentHash(label: string): Promise<ContentHash> {
   }
 }
 
-function contentHashToCID(contentHash: string): CIDContentHash {
+function contentHashToCID(contentHash: string): types.CIDContentHash {
   const ipfsCIDv1 = enshash.helpers.cidV0ToV1Base32(contentHash)
 
   return CID.parse(ipfsCIDv1)
 }
 
-async function getIPFSContent(contentHash: CIDContentHash | string): Promise<Buffer> {
+async function getIPFSContent(contentHash: types.CIDContentHash): Promise<Buffer> {
   const stream = await IPFS_NODE.get(contentHash.toString())
   const chunks = []
 
@@ -88,7 +78,7 @@ async function getIPFSContent(contentHash: CIDContentHash | string): Promise<Buf
 }
 
 async function cacheIPFSContent(
-  contentHash: CIDContentHash | string, 
+  contentHash: types.CIDContentHash, 
   contentBuffer: Buffer
 ) {
   const tarPath = `cache/${contentHash.toString()}.tar`
@@ -102,48 +92,40 @@ async function cacheIPFSContent(
   }
 }
 
-async function pinIPFSContent(contentHash: CIDContentHash | string): Promise<boolean> {
+async function pinIPFSContent(contentHash: types.CIDContentHash): Promise<boolean> {
   const clientRequest = await IPFS_NODE.pin.add(contentHash.toString())
 
   return contentHash.cid === clientRequest.cid
 }
 
-async function isPinnedContent(contentHash: CIDContentHash | string): Promise<boolean> {  
+async function isPinnedContent(contentHash: types.CIDContentHash): Promise<boolean> {  
   const clientRequest = await IPFS_NODE.pin.ls() 
 
-  let pinnedContent: Array<{ cid: CIDContentHash, type: string }> = []
+  let pinnedContent: Array<{ cid: types.CIDContentHash, type: string }> = []
 
   for await(const e of clientRequest) { pinnedContent = pinnedContent.concat(e) }
 
-  const filter = pinnedContent.filter((e) => e.cid.toString() === contentHash.toString())
-  const isPinned = filter.length !== 0
+  const isPinned = pinnedContent.find((e) => e.cid.toString() === contentHash.toString())
 
-  return isPinned
+  return isPinned !== undefined
 }
 
-async function createHiddenService(contentHash: CIDContentHash | string) {
-    await TOR_NODE.createHiddenService(contentHash.toString(), [ 3000 ],  true)
+async function createHiddenService(contentHash: types.CIDContentHash) {
+    await TOR_NODE.createHiddenService(contentHash.toString(), [ config.ONION_PORT ], true)
 }
 
-async function getHiddenService(
-  contentHash: CIDContentHash | string,
-  isCached: boolean
-) {
+async function getHiddenService(contentHash: types.CIDContentHash): Promise<string> {
   let onionAddress
  
   try {
-    let activeServices = await TOR_NODE.getServices()   
-    let cachedServices = activeServices.filter((e: any) => e.name == contentHash.toString())
+    onionAddress = await TOR_NODE.getOnionAddress(contentHash.toString())   
  
-    if(cachedServices.length == 0) {
+    if(!onionAddress) {
       await createHiddenService(contentHash)
-       
-      activeServices = await TOR_NODE.getServices()
-      cachedServices = activeServices.filter((e: any) => e.name == contentHash.toString())
+
+      onionAddress = await TOR_NODE.getOnionAddress(contentHash.toString())   
     }
-    
-    onionAddress = cachedServices[0]?.hostname
-  } catch (e) {  } 
+  } catch (e) { console.log(e) } 
   
   return onionAddress
 }
@@ -160,14 +142,14 @@ function parseENSDomain(hostname: string): string {
 
 async function getContentHashFromOnionAddress(onionAddress: string): Promise<string> {
   const activeServices = await TOR_NODE.getServices()
-  const matchingServices = activeServices.filter((e:any) => e.hostname == onionAddress)
+  const matchingService = activeServices.find((e:any) => e.hostname == onionAddress)
 
-  return matchingServices[0]?.name
+  return matchingService
 }
 
 async function handleWildcardOnions(
-  req: Request,
-  res: Response
+  req: types.Request,
+  res: types.Response
 ) {
   const ipfsHash = await getContentHashFromOnionAddress(req.hostname)
   
@@ -176,27 +158,20 @@ async function handleWildcardOnions(
       path.resolve(), 'cache', ipfsHash
     )  
 
-    RSERVER.use(express.static(dynamicOnionPath))
+    ONION_SERVER.use(express.static(dynamicOnionPath))
     res.sendFile('index.html', { root: dynamicOnionPath })
   
     return
   } else {
-    res.send('NO IPFS STORE')
+    res.send(message.ERR_REVERSE_ONION)
   }
 }
 
 async function handleWildcardPropogation(
-  req: Request,
-  res: Response
+  req: types.Request,
+  res: types.Response
 ) {
-  let hostName
-  // local env, workaround for prototyping
-  if (!req.hostname.includes('.3th.ws')) {
-    hostName = 'onion.tornadocashcommunity.3th.ws'
-  } else {
-    hostName = req.hostname
-  }
-  // // // // // // // // // // // // // //
+  const hostName = req.hostname
   const serveOnions = hostName.includes('onion.')
   const ensLabel = parseENSDomain(hostName)
   const ensDomain = ensLabel + '.eth'
@@ -206,7 +181,7 @@ async function handleWildcardPropogation(
     const ipfsContentHash = payload
 
     if (!(type === 'ipfs' || type === 'ipns')) {
-      res.send("CONTENT NOT SUPPORTED") 
+      res.send(message.ERR_UNSUPPORTED_TYPE) 
       return
     }
 
@@ -224,32 +199,29 @@ async function handleWildcardPropogation(
     ) 
 
     if (!fs.existsSync(path.join(contentPath, 'index.html'))) {
-      res.send("NO STATIC CONTENT AVAILABLE")
+      res.send(message.ERR_NO_STATIC_CONTENT)
       return
     }
 
     if (serveOnions) {
-      const hiddenService = await getHiddenService(
-        ipfsContentHash, 
-        isCached
-      )
+      const onionAddress = await getHiddenService(ipfsContentHash)
 
-      if(hiddenService) { 
-	     res.send(hiddenService)
+      if(onionAddress) { 
+	     res.redirect(`http://${onionAddress}`)
       } else {
-	     res.send('NO ONIONS')
+	     res.send(message.ERR_NO_ONION_SERVICE)
       }
       return
     } else { 
       SERVER.use(express.static(contentPath))  
-      
       res.sendFile('index.html', { root: contentPath })
       
       return
     }
   } catch (e) {
-    console.log('ERROR', e)
-    res.send('FAILED TO RESOLVE')
+    res.send(message.ERR_RESOLVE_CONFLICT)
+    console.log(e)
+
     return
   }
 }
@@ -259,14 +231,15 @@ SERVER.use(express.json())
 SERVER.use(express.raw())
 SERVER.use(cors())
 
+ONION_SERVER.get('/', handleWildcardOnions)
 SERVER.get('/', handleWildcardPropogation)
-RSERVER.get('/', handleWildcardOnions)
  
-SERVER.listen(PORT, async() => {
+SERVER.listen(config.SERVER_PORT, async() => {
   try {
     await startResolver()
-    console.log('// Resolver ::: on //') 
+    console.log(message.SERVER_INIT) 
   } catch (e) {
-    console.log(`// Failed ::: ${e} //`)
+    console.log(message.SERVER_FAIL)
+    console.log(e)
   }
 })

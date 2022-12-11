@@ -13,9 +13,7 @@
   "dependencies": {
     "@ensdomains/content-hash": "^2.5.7",
     "cors": "^2.8.5",
-    "dotenv": "^16.0.1",
     "express": "^4.18.1",
-    "file-type": "^18.0.0",
     "ipfs-http-client": "^59.0.0",
     "tar-fs": "^2.1.1",
     "ths": "^2.1.5",
