@@ -30,12 +30,15 @@ const NODE_ENDPOINT = new URL('http://127.0.0.1:5001')
 const IPFS_NODE = ipfs.create({ url: NODE_ENDPOINT })
 const TOR_NODE = new ths(path.join(path.resolve(), 'cache'))
 const SERVER = express()
-const PORT = 1338
+const RSERVER = express()
+const PORT = 1337
+const RPORT = 3000
 
 async function startResolver() {
-  await TOR_NODE.setTorCommand('/usr/bin/tor-browser')
-  await TOR_NODE.start(true)
+  await TOR_NODE.setTorCommand('/usr/local/bin/tor')
   await TOR_NODE.loadConfig()
+  await TOR_NODE.start(true)
+  await RSERVER.listen(RPORT)
 }
 
 async function getContentHash(label: string): Promise<ContentHash> { 
@@ -119,26 +122,29 @@ async function isPinnedContent(contentHash: CIDContentHash | string): Promise<bo
 }
 
 async function createHiddenService(contentHash: CIDContentHash | string) {
-    await TOR_NODE.createHiddenService(
-      contentHash.toString(), 
-      [ 3000 ],
-      true
-    )
+    await TOR_NODE.createHiddenService(contentHash.toString(), [ 3000 ],  true)
 }
-
-function loadHiddenService() {}
 
 async function getHiddenService(
   contentHash: CIDContentHash | string,
   isCached: boolean
 ) {
+  let onionAddress
+ 
   try {
-    await createHiddenService(contentHash)
-  } catch (e) {}
-
-  const activeServices = await TOR_NODE.getServices()
-  const onionAddress = await TOR_NODE.getOnionAddress(contentHash)
-
+    let activeServices = await TOR_NODE.getServices()   
+    let cachedServices = activeServices.filter((e: any) => e.name == contentHash.toString())
+ 
+    if(cachedServices.length == 0) {
+      await createHiddenService(contentHash)
+       
+      activeServices = await TOR_NODE.getServices()
+      cachedServices = activeServices.filter((e: any) => e.name == contentHash.toString())
+    }
+    
+    onionAddress = cachedServices[0]?.hostname
+  } catch (e) {  } 
+  
   return onionAddress
 }
 
@@ -150,6 +156,13 @@ function parseENSDomain(hostname: string): string {
   } 
 
   return ensLabel
+}
+
+async function getContentHashFromOnionAddress(onionAddress: string): Promise<string> {
+  const activeServices = await TOR_NODE.getServices()
+  const matchingServices = activeServices.filter((e:any) => e.hostname == onionAddress)
+
+  return matchingServices[0]?.name
 }
 
 async function handleWildcardPropogation(
@@ -179,7 +192,7 @@ async function handleWildcardPropogation(
 
     const isCached = await isPinnedContent(ipfsContentHash)
 
-    if(isCached) {
+    if(!isCached) {
       const ipfsContent = await getIPFSContent(ipfsContentHash)
 
       await cacheIPFSContent(ipfsContentHash, ipfsContent)
@@ -187,10 +200,10 @@ async function handleWildcardPropogation(
     }
 
     const contentPath = path.join(
-      path.resolve(), 'cache', ipfsContentHash.toString(), 'index.html'
+      path.resolve(), 'cache', ipfsContentHash.toString()
     ) 
 
-    if (!fs.existsSync(contentPath)) {
+    if (!fs.existsSync(path.join(contentPath, 'index.html'))) {
       res.send("NO STATIC CONTENT AVAILABLE")
       return
     }
@@ -200,12 +213,34 @@ async function handleWildcardPropogation(
         ipfsContentHash, 
         isCached
       )
-      
-      res.send('NO ONIONS')
+
+      if(hiddenService) { 
+        RSERVER.use(express.static(contentPath))
+	RSERVER.get('/', async(req: Request, res: Response) => {
+          if(req.hostname === hiddenService) {
+            const ipfsHash = await getContentHashFromOnionAddress(req.hostname)
+    	    const dynamicOnionPath = path.join(
+     		 path.resolve(), 'cache', ipfsHash
+	    )
+
+	    RSERVER.use(express.static(dynamicOnionPath))
+            res.sendFile('index.html', { root: dynamicOnionPath })
+            return
+  	  } else {
+	    res.sendFile('CANNOT PEEL')
+	    return
+          }
+        })
+	res.send(hiddenService)
+      } else {
+	res.send('NO ONIONS')
+      }
       return
     } else { 
       SERVER.use(express.static(contentPath))  
+      
       res.sendFile('index.html', { root: contentPath })
+      
       return
     }
   } catch (e) {
