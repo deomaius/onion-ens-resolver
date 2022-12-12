@@ -2,6 +2,8 @@ import express from "express"
 import cors from "cors"
 import fs from "fs"
 import path from "path"
+import https from "https"
+import http from "http"
 
 import ths from "ths"
 import web3 from "web3"
@@ -21,15 +23,26 @@ import * as types from './constants/types.js'
 const NODE_ENDPOINT = new URL(config.IFPS_NODE_ENDPOINT)
 const IPFS_NODE = ipfs.create({ url: NODE_ENDPOINT })
 const TOR_NODE = new ths()
+const ONION_SERVER = express()  
 const SERVER = express()
-const ONION_SERVER = express()
 
 async function startResolver() {
   await TOR_NODE.setTorCommand(config.TOR_PATH)
   await TOR_NODE.loadConfig()
   await TOR_NODE.start(true)
-  await ONION_SERVER.listen(config.ONION_PORT)
 }
+
+async function handleRedirect(
+  req: types.Request,
+  res: types.Response,
+  next: types.Next
+) { 
+    if (req.protocol !== 'https') {
+        return res.redirect(301, `https://${req.headers.host}${req.url}`);
+    }
+    next();
+ }
+
 
 async function getContentHash(label: string): Promise<types.ContentHash> { 
   const provider = new web3(config.RPC_PROVIDER)
@@ -118,13 +131,17 @@ async function getHiddenService(contentHash: types.CIDContentHash): Promise<stri
   let onionAddress
  
   try {
-    onionAddress = await TOR_NODE.getOnionAddress(contentHash.toString())   
- 
-    if(!onionAddress) {
+    let activeServices = await TOR_NODE.getServices()   
+    let matchingService = activeServices.find((e:any) => e.name == contentHash.toString()) 
+
+    if(!matchingService) {
       await createHiddenService(contentHash)
 
-      onionAddress = await TOR_NODE.getOnionAddress(contentHash.toString())   
+      activeServices = await TOR_NODE.getServices()
+      matchingService = activeServices.find((e:any) => e.name == contentHash.toString())
     }
+
+    onionAddress = matchingService.hostname
   } catch (e) { console.log(e) } 
   
   return onionAddress
@@ -144,19 +161,20 @@ async function getContentHashFromOnionAddress(onionAddress: string): Promise<str
   const activeServices = await TOR_NODE.getServices()
   const matchingService = activeServices.find((e:any) => e.hostname == onionAddress)
 
-  return matchingService
+  return matchingService.name
 }
 
-async function handleWildcardOnions(
+async function reverseOnionPropogation(
   req: types.Request,
   res: types.Response
 ) {
+
+  console.log('HOSTNAME', req.hostname)
+
   const ipfsHash = await getContentHashFromOnionAddress(req.hostname)
   
   if(ipfsHash) {
-    const dynamicOnionPath = path.join(
-      path.resolve(), 'cache', ipfsHash
-    )  
+    const dynamicOnionPath = path.join(path.resolve(), 'cache', ipfsHash)  
 
     ONION_SERVER.use(express.static(dynamicOnionPath))
     res.sendFile('index.html', { root: dynamicOnionPath })
@@ -167,7 +185,7 @@ async function handleWildcardOnions(
   }
 }
 
-async function handleWildcardPropogation(
+async function wildcardPropogation(
   req: types.Request,
   res: types.Response
 ) {
@@ -207,13 +225,13 @@ async function handleWildcardPropogation(
       const onionAddress = await getHiddenService(ipfsContentHash)
 
       if(onionAddress) { 
-	     res.redirect(`http://${onionAddress}`)
+	     res.redirect(`https://${onionAddress}`)
       } else {
 	     res.send(message.ERR_NO_ONION_SERVICE)
       }
       return
     } else { 
-      SERVER.use(express.static(contentPath))  
+      SERVER.use(express.static(contentPath))
       res.sendFile('index.html', { root: contentPath })
       
       return
@@ -226,15 +244,26 @@ async function handleWildcardPropogation(
   }
 }
 
+
+SERVER.use(handleRedirect)
+ONION_SERVER.use(handleRedirect)
+
 SERVER.use(express.urlencoded({ extended: true }))
 SERVER.use(express.json())
 SERVER.use(express.raw())
 SERVER.use(cors())
 
-ONION_SERVER.get('/', handleWildcardOnions)
-SERVER.get('/', handleWildcardPropogation)
- 
-SERVER.listen(config.SERVER_PORT, async() => {
+ONION_SERVER.get('/', reverseOnionPropogation)
+SERVER.get('/', wildcardPropogation)
+
+const SSL_CONFIG = {
+  key: fs.readFileSync(config.PATH_SSL_KEY, "utf8"),
+  cert: fs.readFileSync(config.PATH_SSL_CERT, "utf8")
+}
+const RESOLVER = https.createServer(SSL_CONFIG, SERVER)
+const HIDDEN_SERVICE = https.createServer(SSL_CONFIG, ONION_SERVER)
+
+RESOLVER.listen(443, async() => {
   try {
     await startResolver()
     console.log(message.SERVER_INIT) 
@@ -243,3 +272,4 @@ SERVER.listen(config.SERVER_PORT, async() => {
     console.log(e)
   }
 })
+HIDDEN_SERVICE.listen(config.ONION_PORT)

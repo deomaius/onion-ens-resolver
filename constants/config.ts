@@ -4,4 +4,6 @@ export default {
   TOR_PATH: "/usr/local/bin/tor'",
   SERVER_PORT: 443,
   ONION_PORT: 3000
+  PATH_SSL_KEY: "",
+  PATH_SSL_CERT: ""
 }
