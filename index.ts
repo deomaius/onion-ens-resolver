@@ -3,7 +3,6 @@ import cors from "cors"
 import fs from "fs"
 import path from "path"
 import https from "https"
-import http from "http"
 
 import ths from "ths"
 import web3 from "web3"
@@ -23,26 +22,14 @@ import * as types from './constants/types.js'
 const NODE_ENDPOINT = new URL(config.IFPS_NODE_ENDPOINT)
 const IPFS_NODE = ipfs.create({ url: NODE_ENDPOINT })
 const TOR_NODE = new ths()
-const ONION_SERVER = express()  
+const ONION_SERVER = express() 
 const SERVER = express()
 
 async function startResolver() {
   await TOR_NODE.setTorCommand(config.TOR_PATH)
+  await TOR_NODE.start()
   await TOR_NODE.loadConfig()
-  await TOR_NODE.start(true)
 }
-
-async function handleRedirect(
-  req: types.Request,
-  res: types.Response,
-  next: types.Next
-) { 
-    if (req.protocol !== 'https') {
-        return res.redirect(301, `https://${req.headers.host}${req.url}`);
-    }
-    next();
- }
-
 
 async function getContentHash(label: string): Promise<types.ContentHash> { 
   const provider = new web3(config.RPC_PROVIDER)
@@ -98,17 +85,26 @@ async function cacheIPFSContent(
   const extPath = `cache/`
 
   if (!fs.existsSync(tarPath)) {
-    const cid = contentHash.toString()
-
     await fs.writeFileSync(tarPath, contentBuffer)
     await fs.createReadStream(tarPath).pipe(tarfs.extract(extPath))
-  }
+  } 
+}
+
+async function deleteCacheContent(cachedContentPath: string) {
+  await fs.rmSync(cachedContentPath, { recursive: true, force: true })
+  await fs.rmSync(cachedContentPath + '.tar')
 }
 
 async function pinIPFSContent(contentHash: types.CIDContentHash): Promise<boolean> {
   const clientRequest = await IPFS_NODE.pin.add(contentHash.toString())
 
   return contentHash.cid === clientRequest.cid
+}
+
+async function unpinIPFSContent(contentHash: types.CIDContentHash): Promise<boolean> {
+  await IPFS_NODE.pin.rm(contentHash.toString())
+
+  return true
 }
 
 async function isPinnedContent(contentHash: types.CIDContentHash): Promise<boolean> {  
@@ -125,24 +121,29 @@ async function isPinnedContent(contentHash: types.CIDContentHash): Promise<boole
 
 async function createHiddenService(contentHash: types.CIDContentHash) {
     await TOR_NODE.createHiddenService(contentHash.toString(), [ config.ONION_PORT ], true)
+    await TOR_NODE.saveConfig()
 }
 
 async function getHiddenService(contentHash: types.CIDContentHash): Promise<string> {
+  const targetContentHash = contentHash.toString().toLowerCase()
   let onionAddress
  
   try {
+    await TOR_NODE.loadConfig()
+
     let activeServices = await TOR_NODE.getServices()   
-    let matchingService = activeServices.find((e:any) => e.name == contentHash.toString()) 
+    let matchingService = activeServices.find((e:any) => e.name == targetContentHash) 
 
     if(!matchingService) {
-      await createHiddenService(contentHash)
+      await createHiddenService(targetContentHash)
+      await TOR_NODE.loadConfig()
 
       activeServices = await TOR_NODE.getServices()
-      matchingService = activeServices.find((e:any) => e.name == contentHash.toString())
-    }
+      matchingService = activeServices.find((e:any) => e.name == targetContentHash)
+     }
 
     onionAddress = matchingService.hostname
-  } catch (e) { console.log(e) } 
+  } catch (e) { } 
   
   return onionAddress
 }
@@ -157,20 +158,23 @@ function parseENSDomain(hostname: string): string {
   return ensLabel
 }
 
-async function getContentHashFromOnionAddress(onionAddress: string): Promise<string> {
-  const activeServices = await TOR_NODE.getServices()
-  const matchingService = activeServices.find((e:any) => e.hostname == onionAddress)
+async function getContentHashFromOnionAddress(onionAddress: string): Promise<string | undefined> {
+  try {
+    await TOR_NODE.loadConfig()
 
-  return matchingService.name
+    const activeServices = await TOR_NODE.getServices()
+    const matchingService = activeServices.find((e:any) => e.hostname == onionAddress.toLowerCase())
+
+    return matchingService.name
+  } catch (e) { 
+    return undefined
+  }
 }
 
 async function reverseOnionPropogation(
   req: types.Request,
   res: types.Response
 ) {
-
-  console.log('HOSTNAME', req.hostname)
-
   const ipfsHash = await getContentHashFromOnionAddress(req.hostname)
   
   if(ipfsHash) {
@@ -178,11 +182,10 @@ async function reverseOnionPropogation(
 
     ONION_SERVER.use(express.static(dynamicOnionPath))
     res.sendFile('index.html', { root: dynamicOnionPath })
-  
-    return
-  } else {
-    res.send(message.ERR_REVERSE_ONION)
+   } else {
+    res.send(message.ERR_REVERSE_ONION) 
   }
+  return 
 }
 
 async function wildcardPropogation(
@@ -191,10 +194,11 @@ async function wildcardPropogation(
 ) {
   const hostName = req.hostname
   const serveOnions = hostName.includes('onion.')
-  const ensLabel = parseENSDomain(hostName)
-  const ensDomain = ensLabel + '.eth'
-
+  
   try {
+    const ensLabel = parseENSDomain(hostName)
+    const ensDomain = ensLabel + '.eth'
+
     const { type, payload } = await getContentHash(ensDomain)
     const ipfsContentHash = payload
 
@@ -204,19 +208,29 @@ async function wildcardPropogation(
     }
 
     const isCached = await isPinnedContent(ipfsContentHash)
-
-    if(!isCached) {
-      const ipfsContent = await getIPFSContent(ipfsContentHash)
-
-      await cacheIPFSContent(ipfsContentHash, ipfsContent)
-      await pinIPFSContent(ipfsContentHash)
-    }
-
     const contentPath = path.join(
       path.resolve(), 'cache', ipfsContentHash.toString()
-    ) 
+    )
 
-    if (!fs.existsSync(path.join(contentPath, 'index.html'))) {
+    if (!isCached) {
+      const ipfsContent = await getIPFSContent(ipfsContentHash)
+     
+      if (ipfsContent == Buffer.concat([])) {
+        res.send('FAILED TO FETCH CONTENT')
+      } else {
+        try {
+	 await cacheIPFSContent(ipfsContentHash, ipfsContent)
+	 await pinIPFSContent(ipfsContentHash) 
+        } catch (e) {
+         await deleteCacheContent(contentPath)
+        }
+      }
+    }
+
+    if (!fs.existsSync(path.join(contentPath, 'index.html'))) {     
+      await unpinIPFSContent(ipfsContentHash)
+      await deleteCacheContent(contentPath)
+
       res.send(message.ERR_NO_STATIC_CONTENT)
       return
     }
@@ -225,28 +239,21 @@ async function wildcardPropogation(
       const onionAddress = await getHiddenService(ipfsContentHash)
 
       if(onionAddress) { 
-	     res.redirect(`https://${onionAddress}`)
+	res.redirect(301, `https://${onionAddress}`)
       } else {
-	     res.send(message.ERR_NO_ONION_SERVICE)
+	res.send(message.ERR_NO_ONION_SERVICE)
       }
-      return
     } else { 
       SERVER.use(express.static(contentPath))
-      res.sendFile('index.html', { root: contentPath })
-      
-      return
+      res.sendFile('index.html', { root: contentPath })  
     }
+    return
   } catch (e) {
     res.send(message.ERR_RESOLVE_CONFLICT)
     console.log(e)
-
     return
   }
 }
-
-
-SERVER.use(handleRedirect)
-ONION_SERVER.use(handleRedirect)
 
 SERVER.use(express.urlencoded({ extended: true }))
 SERVER.use(express.json())
@@ -256,15 +263,15 @@ SERVER.use(cors())
 ONION_SERVER.get('/', reverseOnionPropogation)
 SERVER.get('/', wildcardPropogation)
 
-const SSL_CONFIG = {
-  key: fs.readFileSync(config.PATH_SSL_KEY, "utf8"),
-  cert: fs.readFileSync(config.PATH_SSL_CERT, "utf8")
+const ONION_SSL_CONFIG = {
+  key: fs.readFileSync("/etc/hidden-services/privkey.pem"),
+  cert: fs.readFileSync("/etc/hidden-services/fullchain.pem")
 }
-const RESOLVER = https.createServer(SSL_CONFIG, SERVER)
-const HIDDEN_SERVICE = https.createServer(SSL_CONFIG, ONION_SERVER)
+const HIDDEN_SERVICE = https.createServer(ONION_SSL_CONFIG, ONION_SERVER)
 
-RESOLVER.listen(443, async() => {
+SERVER.listen(1337, async() => {
   try {
+    await HIDDEN_SERVICE.listen(config.ONION_PORT)
     await startResolver()
     console.log(message.SERVER_INIT) 
   } catch (e) {
@@ -272,4 +279,3 @@ RESOLVER.listen(443, async() => {
     console.log(e)
   }
 })
-HIDDEN_SERVICE.listen(config.ONION_PORT)
