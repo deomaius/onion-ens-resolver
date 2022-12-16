@@ -24,13 +24,14 @@ const ONION_SERVER = express()
 const SERVER = express()
 
 async function startResolver() {
-  const cachePath = path.join(path.resolve(), 'cache')
+  const cachePath = path.join(path.resolve(), 'cache')  
   
   if(!fs.existsSync(cachePath)) {
     fs.mkdirSync(cachePath)
   }
  
   await TOR_NODE.setTorCommand(config.TOR_PATH)
+  await TOR_NODE.setBridges(config.TOR_BRIDGES)
   await TOR_NODE.start()
   await TOR_NODE.loadConfig()
 }
@@ -66,6 +67,14 @@ async function getContentHash(label: string): Promise<types.ContentHash> {
   }
 }
 
+async function pinIPFSContent(contentHash: types.CIDContentHash) {
+  await IPFS_NODE.pin.add(contentHash.toString())
+}
+
+async function unpinIPFSContent(contentHash: types.CIDContentHash) {
+  await IPFS_NODE.pin.rm(contentHash.toString())
+}
+
 function contentHashToCID(contentHash: string): types.CIDContentHash {
   const ipfsCIDv1 = enshash.helpers.cidV0ToV1Base32(contentHash)
 
@@ -84,19 +93,22 @@ async function getIPFSContent(contentHash: types.CIDContentHash): Promise<Buffer
 async function cacheIPFSContent(
   contentPath: string,
   contentBuffer: Buffer
-) {
-   const bufferStream = Readable.from(contentBuffer)
+) {  
+  const completeCallback = () => {
+    const isDir = fs.lstatSync(contentPath).isDirectory()
+    const doesExist = fs.existsSync(contentPath)
 
-   bufferStream.pipe(
-     tarfs.extract('./cache/', { }, () => {
-        const isDir = fs.lstatSync(contentPath).isDirectory()
-        const doesExist = fs.existsSync(contentPath)
-	
-        if (!isDir && doesExist) {
-           fs.renameSync(contentPath, contentPath + '.html')
-        }
-     })
-   )
+    if (!isDir && doesExist) {
+      fs.renameSync(contentPath, contentPath + '.html')
+    }
+  }
+  const bufferStream = Readable.from(contentBuffer)
+
+  bufferStream.pipe(tarfs.extract('./cache/', { 
+	   finalize: true, finish: completeCallback 
+	 }, 
+    completeCallback
+  ))
 }
 
 async function deleteCacheContent(contentPath: string) { 
@@ -106,19 +118,6 @@ async function deleteCacheContent(contentPath: string) {
     try {
      await fs.rmSync(contentPath + '.html')
     } catch (e) {}
-
-}
-
-async function pinIPFSContent(contentHash: types.CIDContentHash): Promise<boolean> {
-  const clientRequest = await IPFS_NODE.pin.add(contentHash.toString())
-
-  return contentHash.cid === clientRequest.cid
-}
-
-async function unpinIPFSContent(contentHash: types.CIDContentHash): Promise<boolean> {
-  await IPFS_NODE.pin.rm(contentHash.toString())
-
-  return true
 }
 
 async function isPinnedContent(contentHash: types.CIDContentHash): Promise<boolean> {  
@@ -237,7 +236,7 @@ async function wildcardPropogation(
       const ipfsContent = await getIPFSContent(ipfsContentHash)
      
       if (ipfsContent.length === 0) {
-        res.send('FAILED TO FETCH CONTENT')
+        res.send(message.ERR_FAILED_FETCH)
         return
       } else {
         await cacheIPFSContent(contentPath, ipfsContent)
@@ -261,11 +260,11 @@ async function wildcardPropogation(
       const onionAddress = await getHiddenService(ipfsContentHash)
 
       if(onionAddress) { 
-	res.redirect(301, `https://${onionAddress}`)
+	       res.redirect(301, `https://${onionAddress}`)
       } else {
-	res.send(message.ERR_NO_ONION_SERVICE)
-        return
+         res.send(message.ERR_NO_ONION_SERVICE)
       }
+      return
     } else {  
       const cachePath = path.resolve() + '/cache/'
       const servePath = isStaticDir ? contentPath : cachePath
@@ -273,8 +272,8 @@ async function wildcardPropogation(
 
       SERVER.use(express.static(servePath))
       res.sendFile(`${fileName}.html`, { root: servePath })  
+      return
     }
-    return
   } catch (e) {
     res.send(message.ERR_RESOLVE_CONFLICT)
     console.log(e)
