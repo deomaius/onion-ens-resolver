@@ -6,6 +6,7 @@ import https from "https"
 
 import ths from "ths"
 import web3 from "web3"
+import greenlock from "greenlock"
 import enshash from "@ensdomains/content-hash"
 import * as ipfs from "ipfs-http-client"
 import * as tarfs from "tar-fs"
@@ -18,9 +19,11 @@ import message from './constants/msgs.js'
 import * as types from './constants/types.js'
 
 const NODE_ENDPOINT = new URL(config.IFPS_NODE_ENDPOINT)
+const SSL_REGISTRY = greenlock.create(config.GLOCK_CONFIG)
 const IPFS_NODE = ipfs.create({ url: NODE_ENDPOINT })
-const TOR_NODE = new ths()
+
 const ONION_SERVER = express() 
+const TOR_NODE = new ths()
 const SERVER = express()
 
 async function startResolver() {
@@ -30,6 +33,7 @@ async function startResolver() {
     fs.mkdirSync(cachePath)
   }
  
+  await SSL_REGISTRY.manager.defaults(config.GLOCK_MODULES)
   await TOR_NODE.setTorCommand(config.TOR_PATH)
   await TOR_NODE.setBridges(config.TOR_BRIDGES)
   await TOR_NODE.start()
@@ -64,6 +68,41 @@ async function getContentHash(label: string): Promise<types.ContentHash> {
       payload: CID.parse(cidV0ToV1Base32(ipnsIpfsv0Hash)),
       type: 'ipns'
     }
+  }
+}
+
+async function createCertifciates(domainPath: string) {
+  const isSubdomain = domainPath.includes('.')
+  const wildCardRoot =  domainPath.split('.')[1]
+
+  const domainChallenge = isSubdomain ? "dns-01" : "http-01"
+  const clearnetAddress = `*.${isSubdomain ? wildCardRoot : domainPath}` + '.3th.ws' 
+  const darknetRouterAddress = 'onion.' + clearnetAddress
+
+  await SSL_REGISTRY.add({ 
+    subject: darknetRouterAddress, altnames: [ darknetRouterAddress ], challenges: [ "http-01" ] 
+  })
+  await SSL_REGISTRY.add({ 
+    subject: clearnetAddress, 
+    altnames: [ clearnetAddress ],
+    challenges: [ domainChallenge ]
+  }) 
+}
+
+async function createOnionCertifciate(onionPath: string) {
+  await SSL_REGISTRY.add({ subject: onionPath, altnames: [ onionPath ], challenges: [ "http-01" ] }) 
+}
+
+async function getCertificate(domainPath: string): Promise<types.CertKeypair | undefined> {
+  const matchingRequest = await SSL_REGISTRY.get({ servername: domainPath })
+  
+  if (matchingRequest) {
+    return {
+      key: matchingRequest.pems.privkey,
+      cert: matchingRequest.pems.chain
+    }
+  } else {
+    return undefined 
   }
 }
 
@@ -289,11 +328,7 @@ SERVER.use(cors())
 ONION_SERVER.get('/', reverseOnionPropogation)
 SERVER.get('/', wildcardPropogation)
 
-const ONION_SSL_CONFIG = {
-  key: fs.readFileSync("/etc/hidden-services/privkey.pem"),
-  cert: fs.readFileSync("/etc/hidden-services/fullchain.pem")
-}
-const HIDDEN_SERVICE = https.createServer(ONION_SSL_CONFIG, ONION_SERVER)
+const HIDDEN_SERVICE = https.createServer({}, ONION_SERVER)
 
 SERVER.listen(1337, async() => {
   try {

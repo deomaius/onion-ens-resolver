@@ -10,3 +10,8 @@ export type ContentHash = {
 	type: string, 
 	payload: CIDContentHash  
 }
+
+export type CertKeypair = {
+	key: Buffer,
+	cert: Buffer
+}
