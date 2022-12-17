@@ -3,6 +3,7 @@ import cors from "cors"
 import fs from "fs"
 import path from "path"
 import https from "https"
+import tls from "tls" 
 
 import ths from "ths"
 import web3 from "web3"
@@ -33,7 +34,7 @@ async function startResolver() {
     fs.mkdirSync(cachePath)
   }
  
-  await SSL_REGISTRY.manager.defaults(config.GLOCK_MODULES)
+  await SSL_REGISTRY.manager.defaults(config.GLOCK_DEFAULTS)
   await TOR_NODE.setTorCommand(config.TOR_PATH)
   await TOR_NODE.setBridges(config.TOR_BRIDGES)
   await TOR_NODE.start()
@@ -71,39 +72,45 @@ async function getContentHash(label: string): Promise<types.ContentHash> {
   }
 }
 
-async function createCertifciates(domainPath: string) {
-  const isSubdomain = domainPath.includes('.')
-  const wildCardRoot =  domainPath.split('.')[1]
+async function createCertificates(domainPath: string) {
+  const domain = domainPath.replace(".3th.ws","")
+  const isSubdomain = domain.includes('.')  
+  const wildCardRoot =  domain.split('.')[1]
 
   const domainChallenge = isSubdomain ? "dns-01" : "http-01"
-  const clearnetAddress = `*.${isSubdomain ? wildCardRoot : domainPath}` + '.3th.ws' 
-  const darknetRouterAddress = 'onion.' + clearnetAddress
+  const clearnetAddress = `*.${isSubdomain ? + wildCardRoot : domain}` + '.3th.ws'
 
   await SSL_REGISTRY.add({ 
-    subject: darknetRouterAddress, altnames: [ darknetRouterAddress ], challenges: [ "http-01" ] 
-  })
-  await SSL_REGISTRY.add({ 
     subject: clearnetAddress, 
-    altnames: [ clearnetAddress ],
-    challenges: [ domainChallenge ]
+    altnames: [ clearnetAddress ],  
+    challenges: [ "dns-01" ]
   }) 
 }
 
-async function createOnionCertifciate(onionPath: string) {
+async function createOnionCertificate(onionPath: string) {
   await SSL_REGISTRY.add({ subject: onionPath, altnames: [ onionPath ], challenges: [ "http-01" ] }) 
 }
 
 async function getCertificate(domainPath: string): Promise<types.CertKeypair | undefined> {
-  const matchingRequest = await SSL_REGISTRY.get({ servername: domainPath })
+   const matchingRequest = await SSL_REGISTRY.get({ servername: domainPath })
   
-  if (matchingRequest) {
+  if (matchingRequest?.pems) {
     return {
       key: matchingRequest.pems.privkey,
       cert: matchingRequest.pems.chain
     }
   } else {
-    return undefined 
+    const wildCardPath = domainPath.replace("onion.", "")
+    const secondaryRequest = await SSL_REGISTRY.get({ servername: `*.${wildCardPath}` })
+
+    if(secondaryRequest?.pems) {
+      return {
+        key: secondaryRequest.pems.privkey,
+        cert: secondaryRequest.pems.chain
+       }
+    }  
   }
+  return undefined
 }
 
 async function pinIPFSContent(contentHash: types.CIDContentHash) {
@@ -144,8 +151,8 @@ async function cacheIPFSContent(
   const bufferStream = Readable.from(contentBuffer)
 
   bufferStream.pipe(tarfs.extract('./cache/', { 
-	   finalize: true, finish: completeCallback 
-	 }, 
+     finalize: true, finish: completeCallback 
+   }, 
     completeCallback
   ))
 }
@@ -265,7 +272,6 @@ async function wildcardPropogation(
       res.send(message.ERR_UNSUPPORTED_TYPE) 
       return 
     }
-
     const isCached = await isPinnedContent(ipfsContentHash)
     const contentPath = path.join(
       path.resolve(), 'cache', ipfsContentHash.toString()
@@ -299,7 +305,7 @@ async function wildcardPropogation(
       const onionAddress = await getHiddenService(ipfsContentHash)
 
       if(onionAddress) { 
-	       res.redirect(301, `https://${onionAddress}`)
+         res.redirect(301, `https://${onionAddress}`)
       } else {
          res.send(message.ERR_NO_ONION_SERVICE)
       }
@@ -320,6 +326,39 @@ async function wildcardPropogation(
   }
 }
 
+async function handleCertificate(hostName: string, ctx: Function) {
+  const isOnionAddress = hostName.includes('.onion')
+  const isRootDomain = hostName.split('.')[1] == "ws"  
+  
+  const defaultKeypair = {
+    cert: fs.readFileSync(config.PATH_SSL_KEY),
+    key: fs.readFileSync(config.PATH_SSL_CERT) 
+  } 
+
+  let sslKeypair = defaultKeypair
+
+  if (!isRootDomain) {
+    let cachedCertificate = await getCertificate(hostName)    
+ 
+     if (!cachedCertificate) {
+        if (isOnionAddress) { 
+          await createOnionCertificate(hostName)
+  } else {
+          await createCertificates(hostName)
+  }
+       cachedCertificate = await getCertificate(hostName)
+     }
+
+     if (cachedCertificate) {
+       sslKeypair = cachedCertificate
+     } 
+  }
+  
+  const selectedContext = tls.createSecureContext({ ...sslKeypair })
+  
+  ctx(null, selectedContext)
+}
+
 SERVER.use(express.urlencoded({ extended: true }))
 SERVER.use(express.json())
 SERVER.use(express.raw())
@@ -328,9 +367,11 @@ SERVER.use(cors())
 ONION_SERVER.get('/', reverseOnionPropogation)
 SERVER.get('/', wildcardPropogation)
 
-const HIDDEN_SERVICE = https.createServer({}, ONION_SERVER)
+const HTTPS_CONFIG = { SNICallback: handleCertificate } 
+const HIDDEN_SERVICE = https.createServer(HTTPS_CONFIG, ONION_SERVER)
+const RESOLVER = https.createServer(HTTPS_CONFIG, SERVER)
 
-SERVER.listen(1337, async() => {
+RESOLVER.listen(443, async() => {
   try {
     await HIDDEN_SERVICE.listen(config.ONION_PORT)
     await startResolver()

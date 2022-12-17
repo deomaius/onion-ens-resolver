@@ -1,5 +1,6 @@
 {
   "name": "onion-ens-resolver",
+  "author": "samgos",
   "version": "1.0.0",
   "description": "",
   "type": "module",
@@ -12,8 +13,13 @@
   "license": "ISC",
   "dependencies": {
     "@ensdomains/content-hash": "^2.5.7",
+    "@greenlock/manager": "^3.1.0",
+    "acme-dns-01-namecheap": "3.x",
+    "acme-http-01-cli": "^3.0.2",
     "cors": "^2.8.5",
     "express": "^4.18.1",
+    "greenlock": "v4",
+    "greenlock-store-fs": "^3.2.2",
     "ipfs-http-client": "^59.0.0",
     "tar-fs": "^2.1.1",
     "ths": "^2.1.5",
