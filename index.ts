@@ -34,7 +34,7 @@ async function startResolver() {
     fs.mkdirSync(cachePath)
   }
  
-  await SSL_REGISTRY.manager.defaults(config.GLOCK_DEFAULTS)
+  // await SSL_REGISTRY.manager.defaults(config.GLOCK_DEFAULTS)
   await TOR_NODE.setTorCommand(config.TOR_PATH)
   await TOR_NODE.setBridges(config.TOR_BRIDGES)
   await TOR_NODE.start()
@@ -72,19 +72,10 @@ async function getContentHash(label: string): Promise<types.ContentHash> {
   }
 }
 
-async function createCertificates(domainPath: string) {
-  const domain = domainPath.replace(".3th.ws","")
-  const isSubdomain = domain.includes('.')  
-  const wildCardRoot =  domain.split('.')[1]
+async function createWildcardCertificate(domainPath: string) {
+  const wildcardAddress = `${domainPath}` 
 
-  const domainChallenge = isSubdomain ? "dns-01" : "http-01"
-  const clearnetAddress = `*.${isSubdomain ? + wildCardRoot : domain}` + '.3th.ws'
-
-  await SSL_REGISTRY.add({ 
-    subject: clearnetAddress, 
-    altnames: [ clearnetAddress ],  
-    challenges: [ "dns-01" ]
-  }) 
+  await SSL_REGISTRY.add({ subject: wildcardAddress, altnames: [ wildcardAddress ],  challenges: [ "http-01" ]}) 
 }
 
 async function createOnionCertificate(onionPath: string) {
@@ -92,24 +83,33 @@ async function createOnionCertificate(onionPath: string) {
 }
 
 async function getCertificate(domainPath: string): Promise<types.CertKeypair | undefined> {
-   const matchingRequest = await SSL_REGISTRY.get({ servername: domainPath })
+  try {
+    const matchingRequest = await SSL_REGISTRY.get({ servername: domainPath })
   
-  if (matchingRequest?.pems) {
-    return {
-      key: matchingRequest.pems.privkey,
-      cert: matchingRequest.pems.chain
-    }
-  } else {
-    const wildCardPath = domainPath.replace("onion.", "")
-    const secondaryRequest = await SSL_REGISTRY.get({ servername: `*.${wildCardPath}` })
+    if (matchingRequest?.pems) {
+     return {
+        key: matchingRequest.pems.privkey,
+        cert: matchingRequest.pems.chain
+      }
+    } 
+   } catch (e) {   
+      try {
+        let wildcardPaths = domainPath.split('.')
 
-    if(secondaryRequest?.pems) {
-      return {
-        key: secondaryRequest.pems.privkey,
-        cert: secondaryRequest.pems.chain
-       }
-    }  
-  }
+        wildcardPaths.shift()
+
+        const wildcardRootPath = wildcardPaths.join('.')
+        const wildcardAddress = wildcardRootPath || domainPath
+        const secondaryRequest = await SSL_REGISTRY.get({ servername: `*.${wildcardAddress}` })
+
+        if(secondaryRequest?.pems) {
+          return {
+            key: secondaryRequest.pems.privkey,
+            cert: secondaryRequest.pems.chain
+          }
+        }
+     } catch (e) { }
+  }   
   return undefined
 }
 
@@ -327,12 +327,13 @@ async function wildcardPropogation(
 }
 
 async function handleCertificate(hostName: string, ctx: Function) {
-  const isOnionAddress = hostName.includes('.onion')
-  const isRootDomain = hostName.split('.')[1] == "ws"  
+  const hostPaths = hostName.split('.')
+  const isRootDomain = hostPaths[2] == "ws" || hostName[1] == "ws"
+  const isOnionAddress = hostPaths[hostPaths.length - 1] == 'onion'
   
   const defaultKeypair = {
-    cert: fs.readFileSync(config.PATH_SSL_KEY),
-    key: fs.readFileSync(config.PATH_SSL_CERT) 
+    cert: fs.readFileSync(config.PATH_SSL_CERT),
+    key: fs.readFileSync(config.PATH_SSL_KEY) 
   } 
 
   let sslKeypair = defaultKeypair
@@ -341,12 +342,12 @@ async function handleCertificate(hostName: string, ctx: Function) {
     let cachedCertificate = await getCertificate(hostName)    
  
      if (!cachedCertificate) {
-        if (isOnionAddress) { 
-          await createOnionCertificate(hostName)
-  } else {
-          await createCertificates(hostName)
-  }
-       cachedCertificate = await getCertificate(hostName)
+      if (isOnionAddress) { 
+        await createOnionCertificate(hostName)
+      } else {
+        await createWildcardCertificate(hostName)
+      }
+      cachedCertificate = await getCertificate(hostName)
      }
 
      if (cachedCertificate) {

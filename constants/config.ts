@@ -1,6 +1,6 @@
 import path from "path"
 import acme_dns from "acme-dns-01-namecheap"
-import http_standalone from "acme-http-01-cli"
+import http_standalone from "acme-http-01-standalone"
 
 const httpChallenger = http_standalone.create({ debug: true })
 const dnsChallenger = acme_dns.create({
@@ -30,11 +30,15 @@ export default {
     "74.105.14.122:9001 C26661629B7B8E05CB11D109360D02447EB9B5B5"
   ],
   GLOCK_CONFIG : {
-    packageRoot: `${path.resolve()}/`,
+    packageRoot: __dirname,
     packageAgent: "onion-ens-resolver@0.1",
     maintainerEmail: "navalonion@torproject.org",
-    confiDir: `${path.resolve()}/greenlock.d/`,
-    staging: true
+    configDir: 'greenlock.d/',
+    staging: true,
+     challenges: {
+      "http-01": httpChallenger,
+      "dns-01": dnsChallenger
+     }
   },
   GLOCK_DEFAULTS: {
     subscriberEmail: "navalonion@torproject.org",
@@ -42,10 +46,14 @@ export default {
     store: {
       module: "greenlock-store-fs",
       basePath: "~/.config/greenlock"
-  },
-  challenges: {
-    "http-01": httpChallenger,
-    "dns-01": dnsChallenger
-    }
+    },
+    challenges: {
+     "http-01": {
+         module: "acme-http-01-standalone"
+      },
+      "dns-01": {
+        module: "acme-dns-01-namecheap"
+      }
+   }
   }
 }
