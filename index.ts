@@ -3,12 +3,14 @@ import cors from "cors"
 import fs from "fs"
 import path from "path"
 import https from "https"
+import http from "http"
 import tls from "tls" 
 
 import ths from "ths"
 import web3 from "web3"
 import greenlock from "greenlock"
 import enshash from "@ensdomains/content-hash"
+import rateLimiter from "express-rate-limit"
 import * as ipfs from "ipfs-http-client"
 import * as tarfs from "tar-fs"
 
@@ -26,6 +28,7 @@ const IPFS_NODE = ipfs.create({ url: NODE_ENDPOINT })
 const ONION_SERVER = express() 
 const TOR_NODE = new ths()
 const SERVER = express()
+const PUBLIC = express()
 
 async function startResolver() {
   const cachePath = path.join(path.resolve(), 'cache')  
@@ -34,7 +37,7 @@ async function startResolver() {
     fs.mkdirSync(cachePath)
   }
  
-  // await SSL_REGISTRY.manager.defaults(config.GLOCK_DEFAULTS)
+  await SSL_REGISTRY.manager.defaults(config.GLOCK_DEFAULTS)
   await TOR_NODE.setTorCommand(config.TOR_PATH)
   await TOR_NODE.setBridges(config.TOR_BRIDGES)
   await TOR_NODE.start()
@@ -73,13 +76,28 @@ async function getContentHash(label: string): Promise<types.ContentHash> {
 }
 
 async function createWildcardCertificate(domainPath: string) {
-  const wildcardAddress = `${domainPath}` 
+  const wildcardAddress = `*.${domainPath}` 
 
-  await SSL_REGISTRY.add({ subject: wildcardAddress, altnames: [ wildcardAddress ],  challenges: [ "http-01" ]}) 
+  await SSL_REGISTRY.add({ subject: wildcardAddress, altnames: [ wildcardAddress ],
+     challenges: {
+       "dns-01": {
+           module: "acme-dns-01-namecheap",
+           propogationDelay: 200000,
+	   ...config.DNS_CHALLENGE_PARAMS
+        }
+     }
+  }) 
 }
 
-async function createOnionCertificate(onionPath: string) {
-  await SSL_REGISTRY.add({ subject: onionPath, altnames: [ onionPath ], challenges: [ "http-01" ] }) 
+async function createCertificate(onionPath: string) {
+  await SSL_REGISTRY.add({ subject: onionPath, altnames: [ onionPath ], 
+       challenges: {
+       "http-01": {
+           module: "acme-http-01-webroot",
+           webroot: "/var/www/.well-known/acme-challenge"
+        }
+     } 
+  }) 
 }
 
 async function getCertificate(domainPath: string): Promise<types.CertKeypair | undefined> {
@@ -89,7 +107,7 @@ async function getCertificate(domainPath: string): Promise<types.CertKeypair | u
     if (matchingRequest?.pems) {
      return {
         key: matchingRequest.pems.privkey,
-        cert: matchingRequest.pems.chain
+        cert: matchingRequest.pems.cert 
       }
     } 
    } catch (e) {   
@@ -105,7 +123,7 @@ async function getCertificate(domainPath: string): Promise<types.CertKeypair | u
         if(secondaryRequest?.pems) {
           return {
             key: secondaryRequest.pems.privkey,
-            cert: secondaryRequest.pems.chain
+            cert: secondaryRequest.pems.cert
           }
         }
      } catch (e) { }
@@ -141,11 +159,14 @@ async function cacheIPFSContent(
   contentBuffer: Buffer
 ) {  
   const completeCallback = () => {
-    const isDir = fs.lstatSync(contentPath).isDirectory()
     const doesExist = fs.existsSync(contentPath)
 
-    if (!isDir && doesExist) {
-      fs.renameSync(contentPath, contentPath + '.html')
+    if (doesExist) {
+      const isDir = fs.lstatSync(contentPath).isDirectory()
+      
+      if (!isDir) {
+        fs.renameSync(contentPath, contentPath + '.html')
+      }
     }
   }
   const bufferStream = Readable.from(contentBuffer)
@@ -259,7 +280,7 @@ async function wildcardPropogation(
   res: types.Response
 ) {
   const hostName = req.hostname
-  const serveOnions = hostName.includes('onion.')
+  const serveOnions = hostName?.includes('onion.')
   
   try {
     const ensLabel = parseENSDomain(hostName)
@@ -276,22 +297,25 @@ async function wildcardPropogation(
     const contentPath = path.join(
       path.resolve(), 'cache', ipfsContentHash.toString()
     )
+    let isStaticDir = fs.existsSync(contentPath + '/index.html')
+    let isStatic = fs.existsSync(contentPath + '.html')
+    let hasStaticContent = isStaticDir || isStatic
 
-    if (!isCached) {
+    if (!isCached && !hasStaticContent) {
       const ipfsContent = await getIPFSContent(ipfsContentHash)
-     
+    
       if (ipfsContent.length === 0) {
         res.send(message.ERR_FAILED_FETCH)
         return
       } else {
         await cacheIPFSContent(contentPath, ipfsContent)
+
+        isStaticDir = fs.existsSync(contentPath + '/index.html')
+        isStatic = fs.existsSync(contentPath + '.html')
+        hasStaticContent = isStaticDir || isStatic
       } 
     }
    
-    const isStaticDir = fs.existsSync(contentPath + '/index.html')
-    const isStatic = fs.existsSync(contentPath + '.html')
-    const hasStaticContent = isStaticDir || isStatic
-
     if (!hasStaticContent) {     
       await deleteCacheContent(contentPath)
 
@@ -328,8 +352,10 @@ async function wildcardPropogation(
 
 async function handleCertificate(hostName: string, ctx: Function) {
   const hostPaths = hostName.split('.')
-  const isRootDomain = hostPaths[2] == "ws" || hostName[1] == "ws"
+  const isFirstLevelDomain = hostPaths[2] == "ws" || hostName[1] == "ws"
+  const isRootDomain = hostPaths[1] == "ws" || isFirstLevelDomain
   const isOnionAddress = hostPaths[hostPaths.length - 1] == 'onion'
+  const isDomain = hostName.includes('3th.ws')
   
   const defaultKeypair = {
     cert: fs.readFileSync(config.PATH_SSL_CERT),
@@ -338,15 +364,12 @@ async function handleCertificate(hostName: string, ctx: Function) {
 
   let sslKeypair = defaultKeypair
 
-  if (!isRootDomain) {
+  if (!isRootDomain && isDomain) {
     let cachedCertificate = await getCertificate(hostName)    
  
      if (!cachedCertificate) {
-      if (isOnionAddress) { 
-        await createOnionCertificate(hostName)
-      } else {
-        await createWildcardCertificate(hostName)
-      }
+      await createCertificate(hostName)
+
       cachedCertificate = await getCertificate(hostName)
      }
 
@@ -360,6 +383,17 @@ async function handleCertificate(hostName: string, ctx: Function) {
   ctx(null, selectedContext)
 }
 
+const RATE_LIMITER = rateLimiter({  
+    windowMs: 10 * 60 * 1000,
+    max: 50,
+    message: "TOO MANY REQUESTS",
+    standardHeaders: true,
+    legacyHeaders: false
+})
+
+ONION_SERVER.use(RATE_LIMITER)
+SERVER.use(RATE_LIMITER)
+
 SERVER.use(express.urlencoded({ extended: true }))
 SERVER.use(express.json())
 SERVER.use(express.raw())
@@ -368,9 +402,13 @@ SERVER.use(cors())
 ONION_SERVER.get('/', reverseOnionPropogation)
 SERVER.get('/', wildcardPropogation)
 
-const HTTPS_CONFIG = { SNICallback: handleCertificate } 
+const RESOLVER_CONFIG = { SNICallback: handleCertificate } 
+const HTTPS_CONFIG = {
+  key: fs.readFileSync(config.PATH_SSL_KEY),
+  cert: fs.readFileSync(config.PATH_SSL_CERT) 
+}
 const HIDDEN_SERVICE = https.createServer(HTTPS_CONFIG, ONION_SERVER)
-const RESOLVER = https.createServer(HTTPS_CONFIG, SERVER)
+const RESOLVER = https.createServer(RESOLVER_CONFIG, SERVER)
 
 RESOLVER.listen(443, async() => {
   try {
